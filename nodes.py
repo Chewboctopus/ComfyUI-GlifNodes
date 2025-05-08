@@ -242,6 +242,7 @@ class SDXLAspectRatio:
         return (closest[1], closest[2])
 
 
+
 class ImageToMultipleOf:
     @classmethod
     def INPUT_TYPES(s):
@@ -251,14 +252,14 @@ class ImageToMultipleOf:
                 "multiple_of": (
                     "INT",
                     {
-                        "default": 64,
-                        "min": 1,
-                        "max": 256,
-                        "step": 16,
+                        "default": 64, # Common default, still easily selectable
+                        "min": 1,      # Smallest valid value for "multiple_of"
+                        "max": 4096,   # Increased max for more flexibility (adjust as needed)
+                        "step": 1,     # Allows selection of any integer, solving the 1,9,17 issue
                         "display": "number",
                     },
                 ),
-                "method": (["center crop", "rescale"],),
+                "method": (["center crop", "rescale", "pad with alpha", "pad with black"],),
             }
         }
 
@@ -267,28 +268,88 @@ class ImageToMultipleOf:
     FUNCTION = "run"
     CATEGORY = "image"
 
+    # The run method and the rest of the class remains the same as the previous version
+    # that included "pad with black"
     def run(self, image: Tensor, multiple_of: int, method: str) -> Tuple[Tensor]:
-        """Center crop the image to a specific multiple of a number."""
-        _, height, width, _ = image.shape
+        """Crops, rescales, or pads an image to dimensions that are a multiple of a number."""
+        # Ensure multiple_of is at least 1, even if somehow a lower value bypasses UI min
+        if multiple_of < 1:
+            multiple_of = 1
 
-        new_height = height - (height % multiple_of)
-        new_width = width - (width % multiple_of)
+        _, original_height, original_width, original_channels = image.shape
 
-        if method == "rescale":
-            return (
-                F.interpolate(
-                    image.unsqueeze(0),
-                    size=(new_height, new_width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0),
+        if method == "pad with alpha" or method == "pad with black":
+            new_height = math.ceil(original_height / multiple_of) * multiple_of
+            new_width = math.ceil(original_width / multiple_of) * multiple_of
+
+            pad_top = (new_height - original_height) // 2
+            pad_bottom = new_height - original_height - pad_top
+            pad_left = (new_width - original_width) // 2
+            pad_right = new_width - original_width - pad_left
+
+            num_output_channels = 4
+
+            if method == "pad with alpha":
+                padded_image = torch.zeros((image.shape[0], new_height, new_width, num_output_channels), dtype=image.dtype, device=image.device)
+            else: # "pad with black"
+                padded_image = torch.zeros((image.shape[0], new_height, new_width, num_output_channels), dtype=image.dtype, device=image.device)
+                padded_image[..., 3] = 1.0
+
+            image_insert_slice_h = slice(pad_top, pad_top + original_height)
+            image_insert_slice_w = slice(pad_left, pad_left + original_width)
+
+            if original_channels == 3:
+                padded_image[:, image_insert_slice_h, image_insert_slice_w, :3] = image
+                if method == "pad with alpha":
+                    padded_image[:, image_insert_slice_h, image_insert_slice_w, 3] = 1.0
+            elif original_channels == 4:
+                padded_image[:, image_insert_slice_h, image_insert_slice_w, :] = image
+            elif original_channels == 1:
+                padded_image[:, image_insert_slice_h, image_insert_slice_w, :3] = image.repeat(1,1,1,3)
+                if method == "pad with alpha":
+                     padded_image[:, image_insert_slice_h, image_insert_slice_w, 3] = 1.0
+            else:
+                raise ValueError(f"Unsupported number of image channels: {original_channels}. Expected 1 (Grayscale), 3 (RGB) or 4 (RGBA).")
+
+            return (padded_image,)
+
+        elif method == "rescale":
+            target_height_rescale = (original_height // multiple_of) * multiple_of
+            if target_height_rescale == 0 and original_height > 0 : target_height_rescale = multiple_of
+            target_width_rescale = (original_width // multiple_of) * multiple_of
+            if target_width_rescale == 0 and original_width > 0: target_width_rescale = multiple_of
+
+            if target_height_rescale == 0 or target_width_rescale == 0:
+                if original_height > 0 and target_height_rescale == 0: target_height_rescale = multiple_of
+                if original_width > 0 and target_width_rescale == 0: target_width_rescale = multiple_of
+                if target_height_rescale == 0 or target_width_rescale == 0:
+                    return (image,)
+
+            img_bchw = image.permute(0, 3, 1, 2)
+            rescaled_image_bchw = F.interpolate(
+                img_bchw,
+                size=(target_height_rescale, target_width_rescale),
+                mode="bilinear",
+                align_corners=False,
             )
-        else:
-            top = (height - new_height) // 2
-            left = (width - new_width) // 2
-            bottom = top + new_height
-            right = left + new_width
+            return (rescaled_image_bchw.permute(0, 2, 3, 1),)
+
+        else: # "center crop"
+            new_height_crop = original_height - (original_height % multiple_of)
+            new_width_crop = original_width - (original_width % multiple_of)
+
+            if new_height_crop <= 0 or new_width_crop <= 0: # Check for non-positive dimensions
+                if original_height > 0 and original_width > 0: # Only warn if original had positive dimensions
+                    print(f"Warning: Center crop to multiple of {multiple_of} resulted in non-positive dimension for an image of size {original_width}x{original_height}. Original image returned.")
+                return (image,)
+
+
+            top = (original_height - new_height_crop) // 2
+            left = (original_width - new_width_crop) // 2
+            bottom = top + new_height_crop
+            right = left + new_width_crop
             return (image[:, top:bottom, left:right, :],)
+
 
 
 class HFHubLoraLoader:
